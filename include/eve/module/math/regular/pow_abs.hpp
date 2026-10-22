@@ -11,6 +11,13 @@
 #include <eve/traits/overload.hpp>
 #include <eve/module/core/decorator/core.hpp>
 #include <eve/module/core.hpp>
+#include <eve/module/math/constant/maxlog.hpp>
+#include <eve/module/math/constant/minlog.hpp>
+#include <eve/module/math/constant/minlogdenormal.hpp>
+#include <eve/module/math/constant/log_2.hpp>
+#include <eve/module/math/regular/reverse_horner.hpp>
+#include <eve/module/math/regular/exp.hpp>
+#include <eve/module/math/regular/log.hpp>
 
 namespace eve
 {
@@ -102,6 +109,82 @@ namespace eve
 
   namespace _
   {
+    // |x|^y as exp(y*log|x|), with log|x| evaluated as an unevaluated sum lh + ll and y*log|x| as
+    // th + tl.  The SIMD pow_abs kernel uses it for the lanes it cannot handle by binary
+    // powering.  A finite non-zero result needs |y*log|x|| below about 745 (double) or 104
+    // (float).  The error is mostly that of exp: on sampled inputs over that range the result
+    // stayed within 1 (double) or 2 (float) representable values of the correctly rounded one,
+    // i.e. within about 1.3 or 1.8 ulp of the exact value (measured, not a proven bound).
+    template<floating_simd_value T>
+    EVE_NOINLINE T pow_abs_large(T ax, T y) noexcept
+    {
+      // Product and sum of two unevaluated sums hi + lo (lo may be zero), renormalised.
+      auto mul2 = [](auto ah, auto al, auto bh, auto bl) {
+        auto [p, e] = two_prod(ah, bh);
+        e = fma(ah, bl, fma(al, bh, e));
+        return two_add(p, e);
+      };
+      auto add2 = [](auto ah, auto al, auto bh, auto bl) {
+        auto [s, e] = two_add(ah, bh);
+        return two_add(s, e + al + bl);
+      };
+      // A lane here has a normal x or |y| > 31 (float) or 63 (double).  When x is not a normal
+      // number, |y*log|x|| is then far outside the range of exp, and stays so if x is clamped to
+      // the normal range.  Clamping thus takes care of 0, denormals and infinity; a NaN x is
+      // restored at the end.
+      auto mn = smallestposval(as(ax));
+      auto mx = valmax(as(ax));
+      ax      = if_else(ax < mn, mn, ax);
+      ax      = if_else(ax > mx, mx, ax);
+      // ax = m 2^k, m in [0.75, 1.5[, and log(m) = 2 atanh(s), s = (m-1)/(m+1) in [-1/7, 1/5]
+      auto [m, k] = frexp(ax);
+      auto mlt    = m < T(0.75);
+      m           = if_else(mlt, m + m, m);
+      k           = dec[mlt](k);
+      auto n      = dec(m); // exact
+      auto [dh, dl] = two_add(m, one(as(m)));
+      auto sh     = n / dh;
+      auto sl     = fnma(sh, dl, fnma[pedantic](sh, dh, n)) / dh; // exact remainder
+      // 2 atanh(s) = 2s + (2/3) s^3 + s^5 P(s^2), P(u) = sum_j 2u^j/(2j+5) truncated where its
+      // terms no longer matter at working precision (s^2 <= 1/25)
+      auto [s2h, s2l] = mul2(sh, sl, sh, sl);
+      T    p;
+      if constexpr( std::same_as<element_type_t<T>, float> )
+        p = eve::reverse_horner(s2h, T(2.f/5), T(2.f/7), T(2.f/9), T(2.f/11), T(2.f/13));
+      else
+        p = eve::reverse_horner(s2h, T(2./5), T(2./7), T(2./9), T(2./11), T(2./13), T(2./15)
+                               , T(2./17), T(2./19), T(2./21), T(2./23), T(2./25));
+      T const c23h = ieee_constant<0x1.5555555555555p-1, 0x1.555556p-1f>(as<T>{});
+      T const c23l = ieee_constant<0x1.5555555555555p-55, -0x1.555556p-26f>(as<T>{});
+      T const ln2h = ieee_constant<0x1.62e42fefa39efp-1, 0x1.62e430p-1f>(as<T>{});
+      T const ln2l = ieee_constant<0x1.abc9e3b39803fp-56, -0x1.05c610p-29f>(as<T>{});
+      auto [s3h, s3l] = mul2(s2h, s2l, sh, sl);
+      auto [s5h, s5l] = mul2(s2h, s2l, s3h, s3l);
+      auto [ah, al]   = mul2(s5h, s5l, p, zero(as(p)));
+      auto [bh, bl]   = mul2(s3h, s3l, c23h, c23l);
+      auto [ch, cl]   = add2(ah, al, bh, bl);
+      auto [dh2, dl2] = add2(ch, cl, sh + sh, sl + sl);
+      auto [kh, kl]   = mul2(ln2h, ln2l, k, zero(as(k)));
+      auto [lh, ll]   = add2(kh, kl, dh2, dl2);
+      // y*log|x| = th + tl and exp(th + tl) ~ exp(th) (1 + tl).  Near the ends of the range th
+      // is first moved exactly by 64 log(2) towards 0 (tl absorbs the error) and the result
+      // scaled back: exp returns infinity in the last binade below valmax, and subnormal results
+      // must be rounded after the correction.  frexp is undefined for NaN: restore it.
+      constexpr bool d = sizeof(element_type_t<T>) == 8;
+      auto [ph, pl] = two_prod(y, lh);
+      auto up       = ph > T(d ? 704 : 84);
+      auto dn       = ph < T(d ? -704 : -84);
+      auto sc       = if_else(up, T(64), if_else(dn, T(-64), zero));
+      auto [th, te] = two_add(ph, -sc * ln2h);
+      auto tl       = fma(y, ll, pl) + fnma(sc, ln2l, te);
+      // Far outside the range of exp, th is clamped: exp converts its scale to an integer, which
+      // must stay representable (an emulated conversion out of range is undefined).
+      auto z = exp(if_else(is_nan(th), th, eve::clamp(th, T(d ? -1000 : -150), T(d ? 1000 : 150))));
+      auto zc       = fma(z, tl, z);
+      z             = if_else(is_finite(zc), zc, z);
+      z             = z * if_else(up, T(0x1p64), if_else(dn, T(0x1p-64), one));
+      return if_else(is_nan(ax), ax, z);
+    }
 
     template<floating_scalar_value T,  integral_scalar_value U, callable_options O>
     EVE_FORCEINLINE constexpr T
@@ -137,10 +220,11 @@ namespace eve
           auto [yf, yi]          = eve::modf(eve::abs(y));
           auto test              = yf > r_t(0.5);
           yf                     = dec[test](yf);
-          auto z                 = eve::exp[o](yf*eve::log[o](ax));
+          auto lx                = eve::log[o](ax);
+          auto z                 = eve::exp[o](yf*lx);
           yi                     = inc[test](yi);
           yi                     = if_else(ax_is1, eve::one, yi);
-          auto large             = (yi > r_t(largelimit));
+          auto large             = yi > r_t(largelimit);
           yi                     = if_else(large, eve::one, yi);
 
           auto russian = [](auto base, auto expo){
@@ -155,13 +239,33 @@ namespace eve
           };
           if constexpr (!O::contains(raw)) yi = if_else(is_not_finite(yi), eve::zero, yi);
           z *= russian(ax, convert(yi, uint_from<T>()));
-          z = if_else(large, if_else(ax < one(as(x)), zero, inf(as(x))), z);
           z = if_else(iseqzx && ylt0, zero, z);
           z = if_else(is_infinite(ax), inf(as(x)), z);
           z = if_else(ylt0, rec[pedantic](z), z);
           z = if_else(ax_is1 || is_eqz(y), one, z);
           z = if_else(iseqzx && is_gtz(y), zero, z);
           z = if_else(is_nan(x) && is_nan(y), allbits, z);
+          // Lanes with a normal x where |x|^yi or |x|^|y| (formed before the reciprocal) may
+          // leave the normal range although the result need not also take the helper.  This is
+          // decided here, so that the binary powering does not wait for the logarithm.  The raw
+          // and fast logarithms are within 3% for |log|x|| in [1, 80], but saturate near 88 for
+          // double: route every double lane beyond 80 then.  The range test on x is only needed
+          // when some lane is selected.
+          auto alx = eve::abs(lx);
+          if constexpr( (O::contains(raw) || O::contains(fast)) && sizeof(eli_t) == 8 )
+            alx = if_else(alx > r_t(80), inf(as(alx)), alx);
+          // yi + 1/2 bounds both yi and |y|, and yi = 1 for unit bases keeps them out.
+          auto wider = (yi + r_t(0.5)) * alx > r_t(sizeof(eli_t) == 4 ? 78 : 637);
+          // The binary powering above only handles integral parts up to largelimit, and only
+          // without leaving the normal range.  The other lanes may still have a finite non-zero
+          // result (e.g. (1+2^-30)^64), so they are recomputed from exp and an extended
+          // precision log, which also gives their 0, infinity and NaN special cases (where the
+          // cases above apply to such a lane, they give the same value).
+          if( eve::any(large || wider) )
+          {
+            large = large || (wider && (ax >= smallestposval(as(ax))) && (ax <= valmax(as(ax))));
+            z     = if_else(large, pow_abs_large(ax, y), z);
+          }
           return z;
         }
       }

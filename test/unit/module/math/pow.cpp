@@ -104,6 +104,42 @@ TTS_CASE_TPL("Check  pow", eve::test::simd::all_types)
 };
 
 //==================================================================================================
+// pow with exponents whose integral part is beyond the binary powering range of pow_abs
+//==================================================================================================
+TTS_CASE_TPL("Check pow with large exponents", eve::test::simd::ieee_reals)
+<typename T>(tts::type<T>)
+{
+  using v_t        = eve::element_type_t<T>;
+  constexpr bool d = sizeof(v_t) == 8;
+  auto check = [](v_t a, v_t b)
+  {
+    TTS_ULP_EQUAL(eve::pow(T(a), T(b)), T(std::pow(a, b)), 2) << "x: " << a << " y: " << b << '\n';
+  };
+  check(v_t(1.0001), v_t(64));
+  check(v_t(1.0001), v_t(1000.5));
+  check(v_t(-1.0001), v_t(65));
+  check(v_t(-1.0001), v_t(64));
+  check(v_t(-0.9999), v_t(-1001));
+  check(v_t(-2), v_t(d ? 1023 : 127));
+  check(v_t(-2), v_t(d ? -1021 : -125));
+  check(v_t(0.5), v_t(d ? 1000.5 : 100.5));
+  TTS_IEEE_EQUAL(eve::pow(T(-2), T(d ? 1025 : 129)), eve::minf(eve::as<T>()));
+  TTS_IEEE_EQUAL(eve::pow(T(-2), T(d ? 1024 : 128)), eve::inf(eve::as<T>()));
+  TTS_IEEE_EQUAL(eve::pow(T(-2), T(d ? -1101 : -201)), T(-0.));
+  TTS_EXPECT(eve::all(eve::is_negative(eve::pow(T(-2), T(d ? -1101 : -201)))));
+  TTS_EXPECT(eve::all(eve::is_positive(eve::pow(T(-2), T(d ? -1100 : -200)))));
+  TTS_IEEE_EQUAL(eve::pow(T(-1.0001), T(d ? 1e7 + 1 : 2e6 + 1)), eve::minf(eve::as<T>()));
+  TTS_IEEE_EQUAL(eve::pow(T(-1.0001), T(d ? -1e7 : -2e6)), T(0));
+
+  // Lanes needing and not needing the large exponent path in the same vector
+  auto x = T([](auto i, auto) { return (i % 2 == 0) ? v_t(-1.0001) : v_t(0.9999); });
+  auto y = T([](auto i, auto)
+             { return (i % 3 == 0) ? v_t(3) : (i % 3 == 1) ? v_t(65) : v_t(-127); });
+  auto expected = tts::map([](auto e, auto f) -> v_t { return std::pow(e, f); }, x, y);
+  TTS_ULP_EQUAL(eve::pow(x, y), expected, 8);
+};
+
+//==================================================================================================
 // Tests for masked pow
 //==================================================================================================
 TTS_CASE_WITH("Check behavior of eve::masked(eve::pow)(eve::wide)",

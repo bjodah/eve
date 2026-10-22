@@ -92,6 +92,26 @@ TTS_CASE_TPL("Check  powm1", eve::test::simd::ieee_reals)
 
 
 //==================================================================================================
+// powm1 with large exponents
+//==================================================================================================
+TTS_CASE_TPL("Check powm1 with large exponents", eve::test::simd::ieee_reals)
+<typename T>(tts::type<T>)
+{
+  using v_t = eve::element_type_t<T>;
+  auto check = [](v_t a, v_t b)
+  {
+    TTS_ULP_EQUAL(eve::powm1(T(a), T(b)), T(std::pow(a, b) - 1), 2)
+      << "x: " << a << " y: " << b << '\n';
+  };
+  check(v_t(1.0001), v_t(1e4));
+  check(v_t(0.9999), v_t(-1e4));
+  check(v_t(1.5), v_t(64.5));
+  check(v_t(2), v_t(sizeof(v_t) == 8 ? 1000 : 120));
+  TTS_IEEE_EQUAL(eve::powm1(T(0.5), T(sizeof(v_t) == 8 ? 1100 : 160)), T(-1));
+  TTS_IEEE_EQUAL(eve::powm1(T(2), T(sizeof(v_t) == 8 ? 1024 : 128)), eve::inf(eve::as<T>()));
+};
+
+//==================================================================================================
 // Tests for masked powm1
 //==================================================================================================
 TTS_CASE_WITH("Check behavior of eve::masked(eve::powm1)(eve::wide)",

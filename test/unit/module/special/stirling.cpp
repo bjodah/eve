@@ -44,6 +44,19 @@ TTS_CASE_TPL("Check behavior of stirling on wide", eve::test::simd::ieee_reals)
   TTS_ULP_EQUAL(eve::round(stirling(T(1))), T(1), 0.5);
   TTS_ULP_EQUAL(eve::round(stirling(T(2))), T(1), 0.5);
   TTS_ULP_EQUAL(eve::round(stirling(T(3))), T(2), 0.5);
+
+  // Large arguments use pow_abs with exponents beyond its binary powering range
+  using v_t = eve::element_type_t<T>;
+  for( v_t x : {v_t(20), v_t(30), v_t(34)} )
+    TTS_RELATIVE_EQUAL(stirling(T(x)), T(std::tgamma(x)), 0.01);
+  if constexpr( sizeof(v_t) == 8 )
+  {
+    for( v_t x : {v_t(70), v_t(100), v_t(140), v_t(170)} )
+    {
+      TTS_EXPECT(eve::all(eve::is_finite(stirling(T(x)))));
+      TTS_RELATIVE_EQUAL(stirling(T(x)), T(std::tgamma(x)), 0.01);
+    }
+  }
 };
 
 
